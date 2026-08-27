@@ -91,6 +91,10 @@ impl Live {
                 )
                 .expect("create window"),
         );
+        // The piece takes no pointer input and is installed on a television,
+        // where a cursor parked wherever the last person left it sits on top
+        // of the field for as long as the piece runs.
+        window.set_cursor_visible(false);
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: crate::BACKENDS,
