@@ -39,7 +39,10 @@ substitution at a log level `-loglevel error` hides. Raw video down a pipe
 carries no framing, so reading it at the wrong size shears every frame with
 nothing able to notice — which is why an `ffprobe` runs first and the size the
 stream is really in is the size everything downstream is built from. The
-startup line prints both.
+startup line prints both. That is two identical requests to the same driver
+rather than one look at one negotiation; the only way to close the gap outright
+is a container that carries its own framing, and the one ffmpeg offers is
+YUV-only and would cost a colour conversion in the shader.
 
 The camera is uploaded at capture size rather than display size on purpose.
 Only one line of it is ever looked at, so a 4K frame sixty times a second would
@@ -49,7 +52,10 @@ A camera that ends — unplugged, or its ffmpeg killed — stops the piece with 
 message and a non-zero exit, rather than degrading. It has to: the field would
 otherwise keep writing the last frame it saw, and inside a minute the whole
 screen is that one frozen image, which looks exactly like a working
-installation.
+installation. A lost surface stops it the same way. `run.sh` is the other half
+of that: it restarts on a non-zero exit, and a fresh process re-negotiates the
+camera's mode and rebuilds every GPU resource, which is the only thing that
+would have worked anyway. Quitting on purpose exits zero and ends the loop.
 
 ## Run it without Nix
 
@@ -78,14 +84,20 @@ lands on the column the sweep names and nothing else moves, that columns the
 line has not reached yet are still black, that coming back round writes over
 the first pass rather than stopping, that a downward sweep writes rows, that
 the camera arrives the right way up and the right way round, that a camera the
-wrong shape arrives cropped rather than squashed, that a camera slower than the
-display has its last frame written again, and that the present pass puts the
-field unchanged onto a target in a surface's format rather than the field's.
-There is no skip when there is no adapter: this piece is a GPU program, and a
-suite that passes having rendered nothing is worth less than one that fails.
+wrong shape arrives cropped rather than squashed, and that the present pass
+puts the field unchanged onto a target in a surface's format rather than the
+field's — a BGRA one, since that is what a real display hands back and nothing
+else here would have exercised it. There is no skip when there is no adapter:
+this piece is a GPU program, and a suite that passes having rendered nothing is
+worth less than one that fails.
 
 They also leave `target/evidence/*.png`: the field every eighth of a pass,
 against a camera showing one bright bar sliding up and down. One camera frame
 has one bar in it and the field ends up with a whole wave, because the field's
 x axis is time — which is the piece, and is the thing no single frame could
 produce.
+
+`docs/evidence.png` is a snapshot of that strip — the field at six points
+through a pass and a bit, top to bottom. The wave is one bar photographed at
+250 different moments; the step near the left of the last two is the line
+coming back round and writing over where it started.

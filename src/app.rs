@@ -33,16 +33,14 @@ struct Live {
     field: Field,
 }
 
-/// Why the piece stopped by itself. Reported by exit status, because a
-/// television has no other channel and something has to be able to notice.
-struct Stopped(String);
-
 pub struct App {
-    capture: (u32, u32),
     sweep: crate::sweep::Sweep,
     camera: Camera,
     live: Option<Live>,
-    stopped: Option<Stopped>,
+    /// Why the piece stopped by itself, if it did. It leaves by exit status:
+    /// a television has no other channel, and `run.sh` restarts on a non-zero
+    /// one, which is what makes a dead camera recoverable.
+    stopped: Option<String>,
 }
 
 /// The camera is opened before the window is, so a device that will not open
@@ -58,16 +56,17 @@ pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
-        capture: camera.size(),
         sweep: args.sweep,
         camera,
         live: None,
         stopped: None,
     };
-    event_loop.run_app(&mut app)?;
+    // The stop reason is read before the loop's own error, since it is the
+    // more specific of the two and the one worth printing.
+    let ran = event_loop.run_app(&mut app);
     match app.stopped {
-        Some(Stopped(why)) => Err(why.into()),
-        None => Ok(()),
+        Some(why) => Err(why.into()),
+        None => Ok(ran?),
     }
 }
 
@@ -75,7 +74,7 @@ impl Live {
     /// Every `expect` here is a device that is not there at all — no window
     /// system, no adapter, no surface. There is nothing to recover to and
     /// `ApplicationHandler` cannot return an error, so they are panics; the
-    /// failures that can happen to a *running* piece go through [`Stopped`].
+    /// failures that can happen to a *running* piece go through `App::stopped`.
     async fn new(
         event_loop: &ActiveEventLoop,
         capture: (u32, u32),
@@ -143,10 +142,8 @@ impl Live {
             // waiting for the vertical blank is what paces it. It is also the
             // only thing pacing the run loop; see RETRY.
             present_mode: wgpu::PresentMode::Fifo,
-            // With one line written per present, this is how many frames
-            // behind the moment the live line is. Two is the usual balance of
-            // latency against throughput; here it is also an artistic choice,
-            // and a smaller number would put a fresher line on the glass.
+            // With one line written per present, this is also how many frames
+            // behind the moment the live line is.
             desired_maximum_frame_latency: 2,
             // Every fragment the present pass writes is opaque, so what the
             // compositor does with alpha cannot change the picture.
@@ -204,28 +201,51 @@ impl Live {
         );
     }
 
-    fn render(&mut self, camera: &mut Camera) -> Result<(), Stopped> {
+    /// No catch-all arm: a wgpu that grows another way to not hand over a
+    /// texture should be a compile error here, not a frame silently dropped
+    /// sixty times a second.
+    fn render(&mut self, camera: &mut Camera) -> Result<(), String> {
         use wgpu::CurrentSurfaceTexture as Cst;
+        let mut stale = false;
         let frame = match self.surface.get_current_texture() {
-            // Suboptimal still hands back a usable texture; the compositor
-            // scales what it is given until something reconfigures.
-            Cst::Success(frame) | Cst::Suboptimal(frame) => frame,
-            // The surface goes stale on a display mode change. Reconfiguring
-            // and skipping one frame is the whole recovery.
+            Cst::Success(frame) => frame,
+            // These are the right pixels, drawn for a swapchain that no longer
+            // matches the surface — so show them, then reconfigure. Leaving it
+            // suboptimal means the compositor scales the result, and a scaled
+            // one-pixel line is the one thing this piece cannot survive.
+            Cst::Suboptimal(frame) => {
+                stale = true;
+                frame
+            }
+            // Stale outright: nothing usable came back, so reconfigure and
+            // miss a frame. The wait is not for the reconfigure's sake — it
+            // bounds the case where reconfiguring does not help, since Fifo
+            // blocking in `get_current_texture` is the loop's only other pace.
             Cst::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 std::thread::sleep(RETRY);
                 return Ok(());
             }
-            // Not recoverable by reconfiguring: wgpu's own advice for a lost
-            // surface is to build a new one, or a new device. Stopping is
-            // louder than an unpaced loop that will never come back.
-            Cst::Lost => return Err(Stopped("the surface was lost".into())),
-            other => {
-                log::warn!("dropped a frame: {other:?}");
+            // Nothing is wrong and nobody can see the result. Waiting is the
+            // whole handling; a log line would be sixty a second of it.
+            Cst::Occluded => {
                 std::thread::sleep(RETRY);
                 return Ok(());
             }
+            // A GPU busy enough to miss its deadline. Rare, self-limiting —
+            // wgpu's own timeout is a second — and the next frame is usually
+            // fine.
+            Cst::Timeout => {
+                log::warn!("the surface timed out; dropped a frame");
+                return Ok(());
+            }
+            // Neither is recoverable here: wgpu's advice for a lost surface is
+            // to build a new one or a new device, and a validation failure is
+            // this program's bug. Stopping hands the decision to `run.sh`,
+            // which starts the piece again from nothing — which is the only
+            // thing that would have worked anyway.
+            Cst::Lost => return Err("the surface was lost".into()),
+            Cst::Validation => return Err("the surface refused the request".into()),
         };
         let target = frame
             .texture
@@ -236,7 +256,7 @@ impl Live {
             // The camera is slower than the display, so most frames write
             // their line from the frame already up there.
             Frame::Same => {}
-            Frame::Ended => return Err(Stopped("the camera ended".into())),
+            Frame::Ended => return Err("the camera ended".into()),
         }
         let mut encoder = self
             .device
@@ -247,6 +267,9 @@ impl Live {
         self.field.present(&mut encoder, &target);
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
+        if stale {
+            self.surface.configure(&self.device, &self.config);
+        }
         Ok(())
     }
 }
@@ -257,7 +280,7 @@ impl ApplicationHandler for App {
             return;
         }
         // The one place this program blocks.
-        let live = pollster::block_on(Live::new(event_loop, self.capture, self.sweep));
+        let live = pollster::block_on(Live::new(event_loop, self.camera.size(), self.sweep));
         live.window.request_redraw();
         self.live = Some(live);
     }
@@ -270,9 +293,9 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => live.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
-                if let Err(stopped) = live.render(&mut self.camera) {
-                    log::error!("stopping: {}", stopped.0);
-                    self.stopped = Some(stopped);
+                if let Err(why) = live.render(&mut self.camera) {
+                    log::error!("stopping: {why}");
+                    self.stopped = Some(why);
                     event_loop.exit();
                     return;
                 }

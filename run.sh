@@ -7,9 +7,15 @@
 # Vulkan loader and the windowing libraries at run time, and the shell is what
 # puts them on the library path.
 #
-# `${*@Q}` rather than a printf: printf runs its format once even with no
-# arguments, so it would pass an empty argument the parser rightly rejects —
-# i.e. the bare `./run.sh` would be the one invocation that did not work.
+# `until` is the supervisor, and it is what makes the piece's own error
+# handling worth anything: slitscan stops on a dead camera or a lost surface
+# rather than degrading, and a fresh process re-negotiates the camera's mode
+# and rebuilds every GPU resource — which is the only thing that would have
+# worked anyway. Quitting on purpose exits zero and ends the loop; the sleep
+# keeps a permanent failure to one attempt every five seconds, with its reason
+# on the terminal each time.
 set -euo pipefail
 cd "$(dirname "$0")"
-exec nix-shell --run "cargo run --release -- ${*@Q}"
+until nix-shell --run "cargo run --release -- ${*@Q}"; do
+    sleep 5
+done

@@ -79,9 +79,7 @@ impl Sweep {
 /// is what the camera was pointed at.
 ///
 /// `repr(C)` and `Pod` because this *is* the shader's uniform: the `Crop`
-/// struct in `slit.wgsl` is these four floats in this order, and binding it
-/// with `min_binding_size` set makes a field that drifts out of agreement a
-/// pipeline error rather than a wrong picture.
+/// struct in `slit.wgsl` is these four floats in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct Cover {

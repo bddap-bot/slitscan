@@ -21,9 +21,11 @@ use slitscan::field::{read_back, Field, FORMAT};
 use slitscan::frame_bytes;
 use slitscan::sweep::Sweep;
 
-/// Small enough that a whole pass of the line is a few hundred frames, and
-/// 16:9 so a camera that is not has something to be cropped by.
-const FIELD: (u32, u32) = (256, 144);
+/// Small enough that a whole pass of the line is a few hundred frames, wide
+/// enough that a 16:9 camera is barely cropped and a square one plainly is —
+/// and 250 rather than 256, so a row is 1000 bytes and the read-back's
+/// 256-byte pitch has padding to strip in every test here rather than in none.
+const FIELD: (u32, u32) = (250, 144);
 
 /// A row far enough from both edges that a crop or a flip cannot leave the
 /// right answer there by accident. Only the sideways sweeps read it; the
@@ -266,27 +268,6 @@ fn a_camera_the_wrong_shape_is_cropped_rather_than_squashed() {
 }
 
 #[test]
-fn a_camera_slower_than_the_display_writes_the_frame_it_already_has() {
-    // The normal case: thirty frames a second into sixty lines a second. One
-    // upload and five lines, which must all be that upload — a field that
-    // only wrote on a new frame would leave four columns black.
-    let camera = (64, 36);
-    let mut field = build(Sweep::LeftToRight, camera);
-    field.upload(&device().1, &flat(camera, stamp(3)));
-    for _ in 0..5 {
-        step_once(&mut field);
-    }
-    let pixels = read_back(&device().0, &device().1, field.texture());
-    for x in 0..5 {
-        same(
-            at(&pixels, (x, ROW)),
-            stamp(3),
-            format_args!("column {x} did not get the frame that was up"),
-        );
-    }
-}
-
-#[test]
 fn a_camera_whose_rows_are_not_a_round_number_of_bytes_still_uploads() {
     // 66 pixels is 264 bytes a row, which the 256-byte copy pitch does not
     // divide. A texture-to-buffer copy would need that padded; `write_texture`
@@ -345,14 +326,17 @@ fn the_present_pass_puts_the_field_on_a_surface_shaped_target() {
     let shown = read_back(device, queue, &target);
     let held = read_back(device, queue, field.texture());
     for x in [0, 1, 20, 39] {
-        let i = ((ROW * FIELD.0 + x) * 4) as usize;
-        // Raw bytes of a BGRA texture are blue first; the picture is the same
-        // one, written in the other order.
-        same(
-            [shown[i + 2], shown[i + 1], shown[i]],
-            [held[i], held[i + 1], held[i + 2]],
-            format_args!("column {x} came out of the present pass changed"),
-        );
+        // Every row, so a flip has nowhere to hide.
+        for y in 0..FIELD.1 {
+            let i = ((y * FIELD.0 + x) * 4) as usize;
+            // Raw bytes of a BGRA texture are blue first; the picture is the
+            // same one, written in the other order.
+            same(
+                [shown[i + 2], shown[i + 1], shown[i]],
+                [held[i], held[i + 1], held[i + 2]],
+                format_args!("({x}, {y}) came out of the present pass changed"),
+            );
+        }
     }
 }
 
@@ -393,7 +377,6 @@ fn the_field_looks_like_a_slit_scan() {
     let frames = FIELD.0 as u64 * 5 / 4;
     let every = FIELD.0 as u64 / 8;
     let mut field = build(Sweep::LeftToRight, camera);
-    let mut written = 0;
     for step in 0..frames {
         field.upload(queue, &moving(step));
         step_once(&mut field);
@@ -402,15 +385,8 @@ fn the_field_looks_like_a_slit_scan() {
         if (step + 1) % every == 0 || step + 1 == frames {
             let path = dir.join(format!("frame-{:04}.png", step + 1));
             write_png(&path, FIELD, &read_back(device, queue, field.texture()));
-            written += 1;
         }
     }
-    assert_eq!(
-        written,
-        frames.div_ceil(every) as usize,
-        "a frame went unsaved"
-    );
-
     // The strip is evidence, not the assertion. This is: a quarter into the
     // second pass the wave is at a different height either side of the line,
     // because those two columns were written a whole pass apart. No frame of

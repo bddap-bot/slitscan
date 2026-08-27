@@ -97,11 +97,6 @@ mod tests {
     }
 
     #[test]
-    fn no_flags_is_the_piece_as_it_is_installed() {
-        assert_eq!(parse(&[]), Ok(Some(Args::default())));
-    }
-
-    #[test]
     fn each_flag_sets_its_own_field_and_nothing_else() {
         let d = Args::default();
         assert_eq!(

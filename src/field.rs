@@ -224,9 +224,10 @@ impl Field {
     }
 }
 
-/// A texture's pixels, tightly packed RGBA8, row by row from the top. What the
-/// tests assert on and what the evidence strip is drawn from — the
-/// installation never reads anything back.
+/// A texture's texels, tightly packed in the texture's own format, row by row
+/// from the top — so a BGRA texture comes back blue first. What the tests
+/// assert on and what the evidence strip is drawn from; the installation never
+/// reads anything back.
 pub fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<u8> {
     let (width, height) = (texture.width(), texture.height());
     let row = width as usize * 4;
@@ -380,9 +381,11 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    // Stated rather than inferred, so a `Cover` that grows or
-                    // reorders against the WGSL `Crop` it mirrors is a
-                    // pipeline error instead of a wrong picture.
+                    // Stated rather than inferred, so a WGSL `Crop` that
+                    // outgrows `Cover` is a pipeline error rather than a
+                    // uniform read off the end of the buffer. The other
+                    // direction — a field reordered — is caught by the
+                    // pictures the GPU tests compare.
                     min_binding_size: wgpu::BufferSize::new(size_of::<Cover>() as u64),
                 },
                 count: None,

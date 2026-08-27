@@ -7,9 +7,8 @@
 //!
 //! It is asked for a *mode* rather than sent through a scaler, so the frames
 //! arrive at the sensor's own shape: fitting that shape to the display's is
-//! [`crate::sweep::Cover`]'s job on the GPU, and a scaler here would have
-//! already thrown that shape away. But the mode is a *request* — see
-//! [`granted`], which is the whole reason this module runs two processes.
+//! [`crate::sweep::Cover`]'s job on the GPU. The mode is only a *request*,
+//! which is what [`granted`] is for.
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
@@ -18,11 +17,13 @@ use std::time::Duration;
 
 use crate::frame_bytes;
 
-/// How long the camera has to hand over its first frame before it counts as
-/// broken. A capture device negotiates a format, so this is generous; it only
-/// has to be shorter than a performer's patience, since an ffmpeg that cannot
-/// open the device says so and exits at once rather than waiting it out.
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the camera has to prove it works — separately for each of the two
+/// processes it takes. A device negotiates a format, so this is generous; it
+/// only has to be shorter than a performer's patience, since an ffmpeg that
+/// cannot open the device says so and exits at once rather than waiting it
+/// out. What it bounds is the other case: a node that opens and then never
+/// streams, which without a deadline is a startup that hangs in silence.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ffmpeg's input arguments for a webcam on `device`, asking for its `size`
 /// mode.
@@ -138,7 +139,7 @@ impl Camera {
                 .frames
                 .as_ref()
                 .expect("just built")
-                .recv_timeout(FIRST_FRAME_TIMEOUT)
+                .recv_timeout(STARTUP_TIMEOUT)
                 .map_err(|e| format!("{what}: no frame ({e}); ffmpeg's own error is above"))?,
         );
         Ok(camera)
@@ -153,24 +154,26 @@ impl Camera {
     /// ones dropped: what belongs on the next line is the present, and a
     /// backlog would put the past there instead.
     pub fn frame(&mut self) -> Frame {
-        if let Some(first) = self.first.take() {
-            return Frame::New(first);
-        }
+        // The proof-of-life frame is a *fallback*, not the head of the queue:
+        // by the time the GPU is up, seconds have passed and newer frames are
+        // waiting. Draining first makes the opening column the present, like
+        // every column after it.
+        let first = self.first.take();
         let Some(frames) = self.frames.as_ref() else {
-            return Frame::Ended;
+            return first.map_or(Frame::Ended, Frame::New);
         };
         let mut newest = None;
         loop {
             match frames.try_recv() {
                 Ok(frame) => newest = Some(frame),
                 Err(TryRecvError::Empty) => {
-                    return newest.map_or(Frame::Same, Frame::New);
+                    return newest.or(first).map_or(Frame::Same, Frame::New)
                 }
                 // The reader is gone. Anything it had already handed over is
-                // still the newest thing there is, so it is delivered first
-                // and the end is reported on the next call.
+                // still the newest thing there is, so it goes out first and
+                // the end is reported on the next call.
                 Err(TryRecvError::Disconnected) => {
-                    return newest.map_or(Frame::Ended, Frame::New);
+                    return newest.or(first).map_or(Frame::Ended, Frame::New)
                 }
             }
         }
@@ -193,8 +196,8 @@ impl Drop for Camera {
     }
 }
 
-/// The size ffmpeg will really deliver for `input`, read out of the same
-/// negotiation the capture will do rather than assumed from the request.
+/// The size ffmpeg will deliver for `input`, asked of ffprobe rather than
+/// assumed from the request.
 ///
 /// `-video_size` is advisory. libavdevice's v4l2 demuxer calls `VIDIOC_S_FMT`,
 /// and when the driver answers with a different size it takes that size and
@@ -202,8 +205,17 @@ impl Drop for Camera {
 /// rejected *pixel format* is an error. So a camera that cannot do the mode it
 /// was asked for produces frames of some other size down a pipe that carries
 /// no framing, and reading them at the requested size shears every frame with
-/// nothing anywhere able to notice. Asking ffprobe costs one short-lived
-/// process at startup and removes that failure entirely.
+/// nothing anywhere able to notice.
+///
+/// This is a *second request with the same arguments*, not a look at the one
+/// the capture will make: ffprobe opens the node, negotiates, and closes, and
+/// ffmpeg then negotiates again. A driver whose answer depends on something
+/// that changed in between could still disagree — the honest way to close that
+/// would be a container that carries its own framing, and y4m, the only one
+/// ffmpeg offers that does, is YUV-only and would cost a colour conversion in
+/// the shader. Two identical requests to the same driver removes the failure
+/// people actually hit; the residual is written down here rather than papered
+/// over.
 fn granted(input: &[String]) -> Result<(u32, u32), String> {
     let mut argv: Vec<String> = ["-v", "error", "-select_streams", "v:0"]
         .map(String::from)
@@ -212,19 +224,40 @@ fn granted(input: &[String]) -> Result<(u32, u32), String> {
     argv.extend(["-show_entries", "stream=width,height", "-of", "csv=s=x:p=0"].map(String::from));
     let what = format!("ffprobe {}", input.join(" "));
 
-    let probe = Command::new("ffprobe")
+    let mut probe = Command::new("ffprobe")
         .args(&argv)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output()
+        .spawn()
         .map_err(|e| format!("{what}: cannot run ffprobe: {e}"))?;
-    if !probe.status.success() {
-        return Err(format!(
-            "{what}: {}; ffprobe's own error is above",
-            probe.status
-        ));
+    // On a deadline, because ffprobe has none of its own: a node that opens
+    // and never streams leaves it waiting for a packet forever, and this runs
+    // before there is a window, a log line or anything else to look at.
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    let status = loop {
+        match probe.try_wait() {
+            Ok(Some(status)) => break status,
+            Err(e) => return Err(format!("{what}: {e}")),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                return Err(format!("{what}: no answer in {STARTUP_TIMEOUT:?}"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    if !status.success() {
+        return Err(format!("{what}: {status}; ffprobe's own error is above"));
     }
-    let out = String::from_utf8_lossy(&probe.stdout);
+    let mut stdout = String::new();
+    probe
+        .stdout
+        .take()
+        .expect("stdout is piped")
+        .read_to_string(&mut stdout)
+        .map_err(|e| format!("{what}: {e}"))?;
+    let out = stdout;
     let bad = || format!("{what}: cannot read a size out of {out:?}");
     let (width, height) = out.trim().split_once('x').ok_or_else(bad)?;
     let size = (
@@ -270,22 +303,17 @@ mod tests {
     }
 
     #[test]
-    fn the_size_comes_from_the_stream_and_not_from_the_request() {
-        // The failure this guards is a request the driver does not grant, so
-        // the test is a source whose real size is nothing like the one named
-        // in the arguments — and it is the real one that must come back.
-        let camera = Camera::open(&generator("color=c=red:s=97x53:r=30")).unwrap();
-        assert_eq!(camera.size(), (97, 53));
-    }
-
-    #[test]
     fn a_camera_delivers_whole_frames_of_the_size_it_negotiated() {
-        let size = (64, 48);
+        // 97x53: nothing here says that size, so it can only have come from
+        // the stream — which is the point, since a size taken from the request
+        // instead is what shears every frame. Odd on both axes as well, so a
+        // stride rounded anywhere would not divide it.
+        let size = (97, 53);
         // Red, so a channel swap between ffmpeg and here cannot pass.
-        let mut camera = Camera::open(&generator("color=c=red:s=64x48:r=30")).unwrap();
+        let mut camera = Camera::open(&generator("color=c=red:s=97x53:r=30")).unwrap();
         assert_eq!(camera.size(), size);
         let Frame::New(frame) = camera.frame() else {
-            panic!("open waits for the first frame")
+            panic!("open waits for a first frame")
         };
         assert_eq!(frame.len(), frame_bytes(size));
         assert!(
@@ -308,7 +336,7 @@ mod tests {
         };
         assert!(why.contains("definitely-not-a-camera"), "{why}");
         assert!(
-            began.elapsed() < FIRST_FRAME_TIMEOUT / 2,
+            began.elapsed() < STARTUP_TIMEOUT / 2,
             "{:?}",
             began.elapsed()
         );
@@ -334,10 +362,6 @@ mod tests {
 
     #[test]
     fn a_camera_that_ends_says_so_rather_than_going_quiet() {
-        // Two frames and stop, which is what an unplugged webcam looks like
-        // from this side. The end has to be reportable: a `Same` forever
-        // leaves the field painting one frozen frame across the whole screen,
-        // which looks like a working installation.
         // A source with a duration: ffmpeg reaches the end of it and exits,
         // which is what the reader thread sees when a webcam is unplugged.
         let mut camera = Camera::open(&generator("color=c=blue:s=32x32:r=30:d=0.2")).unwrap();

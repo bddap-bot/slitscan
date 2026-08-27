@@ -13,9 +13,7 @@ pub mod sweep;
 /// also brings up a GL context per instance purely to enumerate adapters.
 pub const BACKENDS: wgpu::Backends = wgpu::Backends::PRIMARY;
 
-/// Bytes in one tightly packed RGBA8 frame. Here rather than in `camera`
-/// because `field` needs it too, and a texture's size is not a camera's
-/// business.
+/// Bytes in one tightly packed RGBA8 frame.
 pub fn frame_bytes((width, height): (u32, u32)) -> usize {
     width as usize * height as usize * 4
 }
