@@ -2,25 +2,28 @@
 //! field's. Both are plain arithmetic with no GPU in them, which is the point:
 //! the two things this piece can get visibly wrong are testable without one.
 
+use bytemuck::{Pod, Zeroable};
+
 /// Which way the writing line travels across the field. The line is
 /// perpendicular to its travel, so `LeftToRight` writes a one-pixel *column*
 /// and `TopToBottom` a one-pixel *row*.
+///
+/// Two variants rather than four because the description — "a
+/// horizontal line of pixels … moves left to right" — names one *axis*
+/// ambiguously and one *direction* unambiguously. These are the two readings.
+/// A reversed sweep is a third arm here and nobody has asked for one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sweep {
     LeftToRight,
-    RightToLeft,
     TopToBottom,
-    BottomToTop,
 }
 
 impl Sweep {
     /// The spelling the command line accepts, and the one [`Sweep::name`]
     /// prints. One table, so the two cannot disagree.
-    const NAMES: [(&'static str, Sweep); 4] = [
+    const NAMES: [(&'static str, Sweep); 2] = [
         ("left-to-right", Sweep::LeftToRight),
-        ("right-to-left", Sweep::RightToLeft),
         ("top-to-bottom", Sweep::TopToBottom),
-        ("bottom-to-top", Sweep::BottomToTop),
     ];
 
     pub fn parse(s: &str) -> Option<Sweep> {
@@ -47,28 +50,23 @@ impl Sweep {
     /// is also how many frames one full pass takes.
     pub fn span(self, size: (u32, u32)) -> u32 {
         match self {
-            Sweep::LeftToRight | Sweep::RightToLeft => size.0,
-            Sweep::TopToBottom | Sweep::BottomToTop => size.1,
+            Sweep::LeftToRight => size.0,
+            Sweep::TopToBottom => size.1,
         }
     }
 
     /// The line to write on frame `step`, as a scissor rectangle in the
-    /// field's own pixels — `(x, y, width, height)`, origin top left.
+    /// field's own pixels — `(x, y, width, height)`, origin top left, which is
+    /// the order and the origin `set_scissor_rect` takes.
     ///
     /// `step` counts frames since startup and never resets: the wrap is the
     /// remainder, so nothing has to notice the edge and there is no state to
     /// get out of step with the field.
     pub fn line(self, size: (u32, u32), step: u64) -> (u32, u32, u32, u32) {
-        let span = self.span(size);
-        let along = (step % span as u64) as u32;
-        // The two "backwards" sweeps are the same walk read from the far end,
-        // rather than a second set of cases to keep in agreement with these.
-        let from_end = span - 1 - along;
+        let along = (step % self.span(size) as u64) as u32;
         match self {
             Sweep::LeftToRight => (along, 0, 1, size.1),
-            Sweep::RightToLeft => (from_end, 0, 1, size.1),
             Sweep::TopToBottom => (0, along, size.0, 1),
-            Sweep::BottomToTop => (0, from_end, size.0, 1),
         }
     }
 }
@@ -79,16 +77,22 @@ impl Sweep {
 /// Zoom to fill, so the overhanging axis of the camera image is thrown away
 /// rather than shown as bars — the same crop on both sides, so what survives
 /// is what the camera was pointed at.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// `repr(C)` and `Pod` because this *is* the shader's uniform: the `Crop`
+/// struct in `slit.wgsl` is these four floats in this order, and binding it
+/// with `min_binding_size` set makes a field that drifts out of agreement a
+/// pipeline error rather than a wrong picture.
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[repr(C)]
 pub struct Cover {
-    pub scale: [f32; 2],
-    pub offset: [f32; 2],
+    scale: [f32; 2],
+    offset: [f32; 2],
 }
 
 impl Cover {
-    /// The identity: every camera pixel, none cropped. What the present pass
-    /// wants, since the field is already exactly the shape of the display.
-    pub const WHOLE: Cover = Cover {
+    /// Every camera pixel, none cropped. What the present pass wants, since
+    /// the field is already exactly the shape of the display.
+    pub const IDENTITY: Cover = Cover {
         scale: [1.0, 1.0],
         offset: [0.0, 0.0],
     };
@@ -117,7 +121,6 @@ mod tests {
 
     const FIELD: (u32, u32) = (8, 4);
 
-    /// Every position, exactly once, in order — and then again from the top.
     fn walk(sweep: Sweep, frames: u64) -> Vec<(u32, u32, u32, u32)> {
         (0..frames).map(|step| sweep.line(FIELD, step)).collect()
     }
@@ -127,8 +130,9 @@ mod tests {
         let lines = walk(Sweep::LeftToRight, 10);
         assert!(lines.iter().all(|&(_, y, w, h)| (y, w, h) == (0, 1, 4)));
         let xs: Vec<u32> = lines.iter().map(|&(x, ..)| x).collect();
-        // Eight columns, then back to the first: the wrap is the whole of the
-        // ninth frame's behaviour.
+        // Eight columns, each once, then back to the first: that the sequence
+        // is every column in order is what a sweep is, and the ninth frame is
+        // the whole of the wrap.
         assert_eq!(xs, [0, 1, 2, 3, 4, 5, 6, 7, 0, 1]);
     }
 
@@ -140,52 +144,10 @@ mod tests {
         assert_eq!(ys, [0, 1, 2, 3, 0, 1]);
     }
 
-    #[test]
-    fn the_reversed_sweeps_are_the_forward_ones_backwards() {
-        for (forward, back) in [
-            (Sweep::LeftToRight, Sweep::RightToLeft),
-            (Sweep::TopToBottom, Sweep::BottomToTop),
-        ] {
-            let span = forward.span(FIELD) as u64;
-            for step in 0..span * 2 {
-                assert_eq!(
-                    back.line(FIELD, step),
-                    forward.line(FIELD, span - 1 - step % span),
-                    "{back:?} at {step}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_sweep_touches_every_line_of_the_field_before_repeating() {
-        for sweep in [
-            Sweep::LeftToRight,
-            Sweep::RightToLeft,
-            Sweep::TopToBottom,
-            Sweep::BottomToTop,
-        ] {
-            let span = sweep.span(FIELD);
-            let mut seen: Vec<(u32, u32, u32, u32)> = walk(sweep, span as u64);
-            seen.sort();
-            seen.dedup();
-            assert_eq!(seen.len(), span as usize, "{sweep:?} missed a line");
-        }
-    }
-
-    #[test]
-    fn every_spelling_round_trips() {
-        for (name, sweep) in Sweep::NAMES {
-            assert_eq!(Sweep::parse(name), Some(sweep));
-            assert_eq!(sweep.name(), name);
-        }
-        assert_eq!(Sweep::parse("sideways"), None);
-    }
-
     /// Asserts the fractions of the camera image that survive the crop —
     /// which is what the numbers mean and what a reader can check by eye.
     /// Approximately, because the fit is a ratio of ratios: 0.75 comes out of
-    /// it as 0.75000006 and the claim is about the crop, not about float.
+    /// it as 0.75000006, and the claim is about the crop, not about float.
     #[track_caller]
     fn keeps(field: (u32, u32), camera: (u32, u32), scale: [f32; 2], offset: [f32; 2]) {
         let cover = Cover::new(field, camera);

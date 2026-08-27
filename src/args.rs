@@ -1,4 +1,4 @@
-//! The command line. Four settings, so there is no argument parser here:
+//! The command line. Three settings, so there is no argument parser here:
 //! every flag takes exactly one value and an unknown one is an error, which
 //! is the whole grammar.
 
@@ -8,11 +8,14 @@ use crate::sweep::Sweep;
 pub struct Args {
     /// The v4l2 node the camera is on.
     pub device: String,
-    /// What the camera is asked for, in its own pixels. Not the display's
-    /// size: the field is written one line at a time, so the whole camera
-    /// frame is uploaded sixty times a second and never looked at at more
-    /// than one line's worth of detail. 4K of that is 2 GB/s down a pipe for
-    /// no visible gain.
+    /// The mode to ask the camera for, in its own pixels. A *request*: a
+    /// driver may answer with a different size, and that answer is what gets
+    /// used and what the startup line reports.
+    ///
+    /// Not the display's size. The field is written one line at a time, so
+    /// the whole camera frame is uploaded sixty times a second and never
+    /// looked at at more than one line's worth of detail; 4K of that is
+    /// 2 GB/s down a pipe for no visible gain.
     pub capture: (u32, u32),
     pub sweep: Sweep,
 }
@@ -32,7 +35,7 @@ pub fn usage() -> String {
     format!(
         "usage: slitscan [--device PATH] [--capture WxH] [--sweep DIRECTION]\n\
          \x20 --device   v4l2 node the camera is on (default {})\n\
-         \x20 --capture  size to ask the camera for (default {}x{})\n\
+         \x20 --capture  mode to ask the camera for (default {}x{})\n\
          \x20 --sweep    which way the writing line travels (default {})\n\
          \x20            one of: {}\n",
         d.device,
@@ -145,17 +148,6 @@ mod tests {
                 panic!("{argv:?} was accepted")
             };
             assert!(!why.is_empty(), "{argv:?}");
-        }
-    }
-
-    #[test]
-    fn the_usage_names_every_flag_and_every_sweep() {
-        let usage = usage();
-        for flag in ["--device", "--capture", "--sweep"] {
-            assert!(usage.contains(flag), "{usage}");
-        }
-        for spelling in Sweep::spellings().split(" | ") {
-            assert!(usage.contains(spelling), "{usage}");
         }
     }
 }

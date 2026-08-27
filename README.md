@@ -14,8 +14,8 @@ and that slowness is the piece.
 ./run.sh --device /dev/video2 --capture 1280x720
 ```
 
-Esc quits. `--sweep` takes `left-to-right`, `right-to-left`, `top-to-bottom` or
-`bottom-to-top`; the line is always perpendicular to its travel.
+Esc quits. `--sweep` takes `left-to-right` or `top-to-bottom`; the line is
+always perpendicular to its travel.
 
 ## How it works
 
@@ -33,16 +33,30 @@ that keeps the sensor's own shape, and fitting that shape to the display's is
 the shader's job. A camera and a display of different shapes zoom to fill — the
 overhanging axis is cropped evenly from both ends, never letterboxed.
 
+`--capture` is a request, not a promise. `-video_size` is advisory: the v4l2
+demuxer takes whatever mode the driver answers with and mentions the
+substitution at a log level `-loglevel error` hides. Raw video down a pipe
+carries no framing, so reading it at the wrong size shears every frame with
+nothing able to notice — which is why an `ffprobe` runs first and the size the
+stream is really in is the size everything downstream is built from. The
+startup line prints both.
+
 The camera is uploaded at capture size rather than display size on purpose.
 Only one line of it is ever looked at, so a 4K frame sixty times a second would
 be two gigabytes a second down a pipe for no visible difference.
+
+A camera that ends — unplugged, or its ffmpeg killed — stops the piece with a
+message and a non-zero exit, rather than degrading. It has to: the field would
+otherwise keep writing the last frame it saw, and inside a minute the whole
+screen is that one frozen image, which looks exactly like a working
+installation.
 
 ## Run it without Nix
 
 `shell.nix` pins nixpkgs, carries the `ffmpeg` the camera runs, and puts the
 Vulkan loader and the windowing libraries — which wgpu and winit open at run
 time — on `LD_LIBRARY_PATH`. Without Nix: a Rust toolchain recent enough for
-wgpu 30 and winit 0.30, a working Vulkan driver, and an ffmpeg on `PATH`.
+wgpu 30 and winit 0.30, a working Vulkan driver, and ffmpeg on `PATH`.
 
 ## Tests
 
@@ -51,20 +65,24 @@ nix-shell --run "cargo test"
 ```
 
 The sweep's arithmetic and the zoom-to-fill are pure and tested without a GPU:
-that a pass touches every line of the field exactly once before repeating, that
-the two backwards sweeps are the forwards ones read from the far end, and that
-the crop keeps all of one axis, is centred on the other, and so can never leave
-a bar. The camera is tested against a real ffmpeg — that whole frames of the
-size it was opened at keep arriving, and that a device that will not open is an
-error at once rather than after the first-frame timeout.
+that a pass writes every line of the field in order and wraps at the edge, and
+that the crop keeps all of one axis, is centred on the other, and so can never
+leave a bar. The camera is tested against a real ffmpeg — that the size comes
+from the stream rather than from the request, that whole frames keep arriving,
+that a device that will not open is an error at once rather than after the
+first-frame timeout, and that a camera which ends says so rather than going
+quiet.
 
 The tests in `tests/` run on a real GPU and read the field back: that the line
 lands on the column the sweep names and nothing else moves, that columns the
 line has not reached yet are still black, that coming back round writes over
-the first pass rather than stopping, that a downward sweep writes rows, and
-that a camera the wrong shape arrives cropped rather than squashed. On a
-machine with no adapter each one prints why and returns; libtest still counts
-them as passed.
+the first pass rather than stopping, that a downward sweep writes rows, that
+the camera arrives the right way up and the right way round, that a camera the
+wrong shape arrives cropped rather than squashed, that a camera slower than the
+display has its last frame written again, and that the present pass puts the
+field unchanged onto a target in a surface's format rather than the field's.
+There is no skip when there is no adapter: this piece is a GPU program, and a
+suite that passes having rendered nothing is worth less than one that fails.
 
 They also leave `target/evidence/*.png`: the field every eighth of a pass,
 against a camera showing one bright bar sliding up and down. One camera frame

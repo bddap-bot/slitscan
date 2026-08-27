@@ -8,14 +8,13 @@
 //! some earlier second put there. Present is the same pass again with no crop
 //! and no scissor.
 //!
-//! The tempo is the display's. One line per presented frame is the spec, so
-//! nothing here has a clock — [`Field::advance`] is called once per frame and
-//! the sweep is however fast the surface presents. At 3840 columns and 60 Hz
-//! a pass across the screen takes just over a minute, which is the piece.
+//! Nothing here has a clock. [`Field::advance`] is called once per presented
+//! frame and the sweep is however fast the surface presents — see the present
+//! mode in [`crate::app`], which is where that decision lives.
 
 use wgpu::util::DeviceExt;
 
-use crate::camera::frame_bytes;
+use crate::frame_bytes;
 use crate::sweep::{Cover, Sweep};
 
 /// The field's own format, and the camera texture's. sRGB on both ends of the
@@ -32,8 +31,8 @@ pub struct Field {
     /// so there is no edge for anything to be off by one about.
     step: u64,
     camera: wgpu::Texture,
-    field: wgpu::Texture,
-    view: wgpu::TextureView,
+    texture: wgpu::Texture,
+    target_view: wgpu::TextureView,
     write: Pass,
     present: Pass,
 }
@@ -43,6 +42,14 @@ pub struct Field {
 struct Pass {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
+}
+
+/// What both passes share, built once. Grouped so `Pass::new` takes the three
+/// of them as one thing rather than as three of its arguments.
+struct Common {
+    shader: wgpu::ShaderModule,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
 }
 
 impl Field {
@@ -55,24 +62,24 @@ impl Field {
         sweep: Sweep,
         target: wgpu::TextureFormat,
     ) -> Field {
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/slit.wgsl"));
-        let layout = bind_group_layout(device);
-        // Linear, because zoom-to-fill is a resample: the camera's pixels and
-        // the field's do not line up, and nearest turns that into stair-steps
-        // along every edge. Clamped, because the crop never samples outside
-        // the image, so the wrap mode only shows up on the boundary texel.
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("source"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let common = Common {
+            shader: device.create_shader_module(wgpu::include_wgsl!("shaders/slit.wgsl")),
+            layout: bind_group_layout(device),
+            // Linear, because zoom-to-fill is a resample: the camera's pixels
+            // and the field's do not line up, and nearest turns that into
+            // stair-steps along every edge. Clamped, because the crop never
+            // samples outside the image, so the wrap mode only shows up on
+            // the boundary texel.
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("source"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
+        };
 
-        // wgpu zero-initialises a texture before its first use, so the field
-        // starts black without a clear pass and the present pass can load it
-        // on the very first frame.
         let camera = texture(
             device,
             "camera",
@@ -80,6 +87,9 @@ impl Field {
             FORMAT,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         );
+        // wgpu zero-initialises a texture before its first use, so the field
+        // starts black without a clear pass and the write pass can load it on
+        // the very first frame.
         let field = texture(
             device,
             "field",
@@ -89,7 +99,7 @@ impl Field {
                 | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC,
         );
-        let view = field.create_view(&wgpu::TextureViewDescriptor::default());
+        let target_view = field.create_view(&wgpu::TextureViewDescriptor::default());
 
         Field {
             size,
@@ -98,9 +108,7 @@ impl Field {
             step: 0,
             write: Pass::new(
                 device,
-                &shader,
-                &layout,
-                &sampler,
+                &common,
                 &camera,
                 Cover::new(size, camera_size),
                 FORMAT,
@@ -108,19 +116,17 @@ impl Field {
             ),
             present: Pass::new(
                 device,
-                &shader,
-                &layout,
-                &sampler,
+                &common,
                 &field,
                 // The field is already exactly the shape of the display; the
                 // camera's shape was dealt with on the way in.
-                Cover::WHOLE,
+                Cover::IDENTITY,
                 target,
                 "present",
             ),
             camera,
-            field,
-            view,
+            texture: field,
+            target_view,
         }
     }
 
@@ -133,9 +139,15 @@ impl Field {
         self.sweep.span(self.size)
     }
 
-    /// Hands over the newest camera frame, tightly packed RGBA8 at the size
-    /// this field was built for. Called only when one has arrived: a field
-    /// whose camera has not produced anything keeps writing the last frame,
+    /// The field itself, for a test to read back. The installation never
+    /// touches it.
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    /// Hands over a camera frame, tightly packed RGBA8 at the size this field
+    /// was built for. Called only when a new one has arrived: a field whose
+    /// camera has produced nothing keeps writing the frame already up there,
     /// which is what a camera slower than the display means.
     pub fn upload(&self, queue: &wgpu::Queue, frame: &[u8]) {
         assert_eq!(
@@ -169,7 +181,7 @@ impl Field {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("write"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.view,
+                view: &self.target_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -210,89 +222,81 @@ impl Field {
         });
         self.present.draw(&mut pass);
     }
+}
 
-    /// The field itself, tightly packed RGBA8, row by row from the top. What
-    /// the tests assert on and what the evidence strip is drawn from — the
-    /// installation never reads it back.
-    pub fn read_back(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
-        let (width, height) = self.size;
-        let row = width as usize * 4;
-        // A texture-to-buffer copy writes rows on a 256-byte pitch whatever
-        // the row's own length is, so the padding is stripped below rather
-        // than wished away here.
-        let pitch = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
-            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("read back"),
-            size: (pitch * height as usize) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("read back"),
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.field,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
+/// A texture's pixels, tightly packed RGBA8, row by row from the top. What the
+/// tests assert on and what the evidence strip is drawn from — the
+/// installation never reads anything back.
+pub fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<u8> {
+    let (width, height) = (texture.width(), texture.height());
+    let row = width as usize * 4;
+    // A texture-to-buffer copy writes rows on a 256-byte pitch whatever the
+    // row's own length is, so the padding is stripped below rather than
+    // wished away here.
+    let pitch = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("read back"),
+        size: (pitch * height as usize) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("read back"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch as u32),
+                rows_per_image: Some(height),
             },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(pitch as u32),
-                    rows_per_image: Some(height),
-                },
-            },
-            extent(self.size),
-        );
-        queue.submit([encoder.finish()]);
+        },
+        extent((width, height)),
+    );
+    queue.submit([encoder.finish()]);
 
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map read back buffer"));
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll");
-        let mapped = slice.get_mapped_range().expect("map read back range");
-        let pixels = mapped
-            .chunks(pitch)
-            .flat_map(|r| r[..row].to_vec())
-            .collect();
-        drop(mapped);
-        readback.unmap();
-        pixels
-    }
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map read back buffer"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let mapped = slice.get_mapped_range().expect("map read back range");
+    let pixels = mapped
+        .chunks(pitch)
+        .flat_map(|r| r[..row].to_vec())
+        .collect();
+    drop(mapped);
+    readback.unmap();
+    pixels
 }
 
 impl Pass {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         device: &wgpu::Device,
-        shader: &wgpu::ShaderModule,
-        layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
+        common: &Common,
         source: &wgpu::Texture,
-        crop: Cover,
+        cover: Cover,
         format: wgpu::TextureFormat,
         label: &str,
     ) -> Pass {
         // Written once at build time: the crop only changes when the camera
         // or the display does, and either of those rebuilds the field.
-        let crop = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
-            contents: bytemuck::cast_slice(&[
-                crop.scale[0],
-                crop.scale[1],
-                crop.offset[0],
-                crop.offset[1],
-            ]),
+            contents: bytemuck::bytes_of(&cover),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
-            layout,
+            layout: &common.layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -302,30 +306,30 @@ impl Pass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
+                    resource: wgpu::BindingResource::Sampler(&common.sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: crop.as_entire_binding(),
+                    resource: uniform.as_entire_binding(),
                 },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(label),
-            bind_group_layouts: &[Some(layout)],
+            bind_group_layouts: &[Some(&common.layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: shader,
+                module: &common.shader,
                 entry_point: Some("vs_fullscreen"),
                 compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
-                module: shader,
+                module: &common.shader,
                 entry_point: Some("fs_crop"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
@@ -376,7 +380,10 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: None,
+                    // Stated rather than inferred, so a `Cover` that grows or
+                    // reorders against the WGSL `Crop` it mirrors is a
+                    // pipeline error instead of a wrong picture.
+                    min_binding_size: wgpu::BufferSize::new(size_of::<Cover>() as u64),
                 },
                 count: None,
             },

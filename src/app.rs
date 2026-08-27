@@ -1,6 +1,7 @@
 //! Window, surface and the run loop.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -9,10 +10,21 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::args::Args;
-use crate::camera::Camera;
+use crate::camera::{Camera, Frame};
 use crate::field::Field;
 
+/// How long to wait before trying again when the surface will not hand over a
+/// texture. `Fifo` blocking in `get_current_texture` is the loop's only pacing
+/// — every path that returns without presenting skips it — so a screen that
+/// has gone away would otherwise be a busy loop reconfiguring a 4K swapchain
+/// thousands of times a second.
+const RETRY: Duration = Duration::from_millis(16);
+
 struct Live {
+    /// The two settings the render path needs, held here rather than reached
+    /// for through the command line: a resize rebuilds the field from them.
+    capture: (u32, u32),
+    sweep: crate::sweep::Sweep,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -21,31 +33,54 @@ struct Live {
     field: Field,
 }
 
+/// Why the piece stopped by itself. Reported by exit status, because a
+/// television has no other channel and something has to be able to notice.
+struct Stopped(String);
+
 pub struct App {
-    args: Args,
+    capture: (u32, u32),
+    sweep: crate::sweep::Sweep,
     camera: Camera,
     live: Option<Live>,
+    stopped: Option<Stopped>,
 }
 
 /// The camera is opened before the window is, so a device that will not open
 /// is an error on the terminal rather than a black screen on a television.
 pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let camera = Camera::open(
-        &crate::camera::v4l2(&args.device, args.capture),
-        args.capture,
-    )?;
-    log::info!("camera: {} at {:?}", args.device, args.capture);
+    let camera = Camera::open(&crate::camera::v4l2(&args.device, args.capture))?;
+    log::info!(
+        "camera: {} at {:?} (asked for {:?})",
+        args.device,
+        camera.size(),
+        args.capture
+    );
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    Ok(event_loop.run_app(&mut App {
-        args,
+    let mut app = App {
+        capture: camera.size(),
+        sweep: args.sweep,
         camera,
         live: None,
-    })?)
+        stopped: None,
+    };
+    event_loop.run_app(&mut app)?;
+    match app.stopped {
+        Some(Stopped(why)) => Err(why.into()),
+        None => Ok(()),
+    }
 }
 
 impl Live {
-    async fn new(event_loop: &ActiveEventLoop, args: &Args) -> Live {
+    /// Every `expect` here is a device that is not there at all — no window
+    /// system, no adapter, no surface. There is nothing to recover to and
+    /// `ApplicationHandler` cannot return an error, so they are panics; the
+    /// failures that can happen to a *running* piece go through [`Stopped`].
+    async fn new(
+        event_loop: &ActiveEventLoop,
+        capture: (u32, u32),
+        sweep: crate::sweep::Sweep,
+    ) -> Live {
         let window = Arc::new(
             event_loop
                 .create_window(
@@ -98,17 +133,23 @@ impl Live {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            // Auto resolves to sRGB for an sRGB format, which is the round trip
-            // the format was chosen for.
+            // Auto resolves to sRGB for an sRGB format, which is the round
+            // trip the format was chosen for.
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
             // The display's cadence *is* the sweep's tempo — one line per
             // presented frame — so the piece runs at the refresh rate and
-            // waiting for the vertical blank is what paces it. Anything that
-            // drops or repeats frames would make the sweep stutter.
+            // waiting for the vertical blank is what paces it. It is also the
+            // only thing pacing the run loop; see RETRY.
             present_mode: wgpu::PresentMode::Fifo,
+            // With one line written per present, this is how many frames
+            // behind the moment the live line is. Two is the usual balance of
+            // latency against throughput; here it is also an artistic choice,
+            // and a smaller number would put a fresher line on the glass.
             desired_maximum_frame_latency: 2,
+            // Every fragment the present pass writes is opaque, so what the
+            // compositor does with alpha cannot change the picture.
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -117,19 +158,21 @@ impl Live {
         let field = Field::new(
             &device,
             (config.width, config.height),
-            args.capture,
-            args.sweep,
+            capture,
+            sweep,
             format,
         );
         log::info!(
             "field: {}x{}, sweeping {}, one pass every {} frames",
             config.width,
             config.height,
-            args.sweep.name(),
+            sweep.name(),
             field.span(),
         );
 
         Live {
+            capture,
+            sweep,
             window,
             surface,
             device,
@@ -141,49 +184,59 @@ impl Live {
 
     /// A resize rebuilds the field at the new size, which empties it. The
     /// field is the screen's own pixels — there is no meaning to carry across
-    /// a change of how many there are — and the installation never resizes.
-    fn resize(&mut self, args: &Args, width: u32, height: u32) {
+    /// a change of how many there are. It happens once, when the compositor
+    /// hands the window its real size at startup; anything later is a display
+    /// mode change and worth a log line, since it wipes the piece.
+    fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 || (width, height) == self.field.size() {
             return;
         }
+        log::info!("resized to {width}x{height}; the field starts again from black");
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.field = Field::new(
             &self.device,
             (width, height),
-            args.capture,
-            args.sweep,
+            self.capture,
+            self.sweep,
             self.config.format,
         );
     }
 
-    fn render(&mut self, camera: &mut Camera) {
+    fn render(&mut self, camera: &mut Camera) -> Result<(), Stopped> {
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
-            // Suboptimal still hands back a usable texture, and the next
-            // resize reconfigures the surface anyway.
+            // Suboptimal still hands back a usable texture; the compositor
+            // scales what it is given until something reconfigures.
             Cst::Success(frame) | Cst::Suboptimal(frame) => frame,
-            // The surface goes stale on a monitor change and on compositor
-            // restarts. Reconfiguring and skipping one frame is the whole
-            // recovery.
-            Cst::Outdated | Cst::Lost => {
+            // The surface goes stale on a display mode change. Reconfiguring
+            // and skipping one frame is the whole recovery.
+            Cst::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                std::thread::sleep(RETRY);
+                return Ok(());
             }
+            // Not recoverable by reconfiguring: wgpu's own advice for a lost
+            // surface is to build a new one, or a new device. Stopping is
+            // louder than an unpaced loop that will never come back.
+            Cst::Lost => return Err(Stopped("the surface was lost".into())),
             other => {
                 log::warn!("dropped a frame: {other:?}");
-                return;
+                std::thread::sleep(RETRY);
+                return Ok(());
             }
         };
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // The camera runs slower than the display, so most frames have
-        // nothing new and write the line from the frame already up there.
-        if let Some(pixels) = camera.frame() {
-            self.field.upload(&self.queue, &pixels);
+        match camera.frame() {
+            Frame::New(pixels) => self.field.upload(&self.queue, &pixels),
+            // The camera is slower than the display, so most frames write
+            // their line from the frame already up there.
+            Frame::Same => {}
+            Frame::Ended => return Err(Stopped("the camera ended".into())),
         }
         let mut encoder = self
             .device
@@ -194,6 +247,7 @@ impl Live {
         self.field.present(&mut encoder, &target);
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
+        Ok(())
     }
 }
 
@@ -203,7 +257,7 @@ impl ApplicationHandler for App {
             return;
         }
         // The one place this program blocks.
-        let live = pollster::block_on(Live::new(event_loop, &self.args));
+        let live = pollster::block_on(Live::new(event_loop, self.capture, self.sweep));
         live.window.request_redraw();
         self.live = Some(live);
     }
@@ -214,9 +268,14 @@ impl ApplicationHandler for App {
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => live.resize(&self.args, size.width, size.height),
+            WindowEvent::Resized(size) => live.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
-                live.render(&mut self.camera);
+                if let Err(stopped) = live.render(&mut self.camera) {
+                    log::error!("stopping: {}", stopped.0);
+                    self.stopped = Some(stopped);
+                    event_loop.exit();
+                    return;
+                }
                 live.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {

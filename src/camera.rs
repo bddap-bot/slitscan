@@ -5,15 +5,18 @@
 //! YUYV depending on the mode it lands in, and decoding either one here would
 //! be this piece's largest component by far for no visible difference.
 //!
-//! It is asked for a *mode* (`-video_size`) rather than sent through a
-//! scaler, so the frames arrive at the sensor's own shape: fitting the
-//! camera's shape to the display's is [`crate::sweep::Cover`]'s job on the
-//! GPU, and a scaler here would have already thrown that shape away.
+//! It is asked for a *mode* rather than sent through a scaler, so the frames
+//! arrive at the sensor's own shape: fitting that shape to the display's is
+//! [`crate::sweep::Cover`]'s job on the GPU, and a scaler here would have
+//! already thrown that shape away. But the mode is a *request* — see
+//! [`granted`], which is the whole reason this module runs two processes.
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::time::Duration;
+
+use crate::frame_bytes;
 
 /// How long the camera has to hand over its first frame before it counts as
 /// broken. A capture device negotiates a format, so this is generous; it only
@@ -21,15 +24,15 @@ use std::time::Duration;
 /// open the device says so and exits at once rather than waiting it out.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// ffmpeg's input arguments for a webcam on `device` in its `size` mode.
+/// ffmpeg's input arguments for a webcam on `device`, asking for its `size`
+/// mode.
 ///
 /// Every piece is written here rather than taken from the command line: the
 /// device name lands as the argument of `-i`, which ffmpeg reads positionally,
 /// so nothing a `--device` value can say becomes a flag.
 pub fn v4l2(device: &str, size: (u32, u32)) -> Vec<String> {
     // Before -i, so it is the *input's* option: after it, ffmpeg reads it as
-    // the output's and the camera is left in whatever mode it defaulted to
-    // while this still expects frames of `size`.
+    // the output's, which scales rather than negotiates.
     let (width, height) = size;
     [
         "-f",
@@ -43,17 +46,29 @@ pub fn v4l2(device: &str, size: (u32, u32)) -> Vec<String> {
     .to_vec()
 }
 
-/// Bytes in one tightly packed RGBA8 frame.
-pub fn frame_bytes(size: (u32, u32)) -> usize {
-    size.0 as usize * size.1 as usize * 4
+/// What the camera had when it was asked.
+pub enum Frame {
+    /// A new frame, tightly packed RGBA8 at [`Camera::size`].
+    New(Vec<u8>),
+    /// Nothing since the last call. The field's copy is already the most
+    /// recent one and wants no upload — the normal case, since a camera runs
+    /// at half the display's rate or less.
+    Same,
+    /// The camera is gone and will not come back: unplugged, or its ffmpeg
+    /// died. Terminal, and deliberately not survivable — a field that keeps
+    /// writing one frozen frame paints it across the whole screen inside a
+    /// minute and looks exactly like a working installation.
+    Ended,
 }
 
 pub struct Camera {
+    /// The size frames actually arrive at, which is what the pipe is framed
+    /// on and what the field's crop is built from.
+    size: (u32, u32),
     child: Child,
     /// One frame in flight. That bound is the throttle: ffmpeg blocks on its
     /// own pipe once the reader is holding a frame nobody has collected, so
-    /// nothing queues up ahead of what is on the glass. A camera paces itself
-    /// well under the display's rate, so in practice it never blocks.
+    /// nothing queues up ahead of what is on the glass.
     ///
     /// `None` only while [`Camera::drop`] is releasing the reader.
     frames: Option<Receiver<Vec<u8>>>,
@@ -64,15 +79,16 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// Starts an ffmpeg with `input` arguments producing frames of `size`,
-    /// blocking until one has arrived — so a device that will not open is an
-    /// error here, at startup, rather than a black field nobody can explain.
+    /// Starts an ffmpeg with `input` arguments, blocking until a frame has
+    /// arrived — so a device that will not open is an error here, at startup,
+    /// rather than a black field nobody can explain.
     ///
     /// `input` is a whole argument list rather than a device path so that the
     /// tests can point this at one of ffmpeg's own generators: what is worth
-    /// testing is the pipe, the framing and the shutdown, none of which cares
-    /// what ffmpeg opened.
-    pub fn open(input: &[String], size: (u32, u32)) -> Result<Camera, String> {
+    /// testing is the negotiation, the pipe and the shutdown, none of which
+    /// cares what ffmpeg opened.
+    pub fn open(input: &[String]) -> Result<Camera, String> {
+        let size = granted(input)?;
         let mut argv: Vec<String> = ["-nostdin", "-loglevel", "error"]
             .map(String::from)
             .to_vec();
@@ -98,10 +114,8 @@ impl Camera {
             let mut frame = vec![0u8; bytes];
             // A short read is the stream ending — a killed child, or a camera
             // unplugged — and a send that fails is this Camera being dropped.
-            // Either way the last whole frame stays on the field and this
-            // thread is done.
             if stdout.read_exact(&mut frame).is_err() {
-                log::warn!("{ended} ended; the field keeps its last frame");
+                log::warn!("{ended} ended");
                 return;
             }
             if send.send(frame).is_err() {
@@ -110,6 +124,7 @@ impl Camera {
         });
 
         let mut camera = Camera {
+            size,
             child,
             frames: Some(frames),
             first: None,
@@ -129,17 +144,36 @@ impl Camera {
         Ok(camera)
     }
 
-    /// The newest frame since the last call, tightly packed RGBA8, or `None`
-    /// when nothing has arrived — in which case the field's copy is already
-    /// the most recent one and wants no upload. A camera that has ended
-    /// returns `None` for good.
-    pub fn frame(&mut self) -> Option<Vec<u8>> {
+    /// The size frames arrive at — the driver's answer, not the request.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// The newest frame the camera has produced since the last call, older
+    /// ones dropped: what belongs on the next line is the present, and a
+    /// backlog would put the past there instead.
+    pub fn frame(&mut self) -> Frame {
         if let Some(first) = self.first.take() {
-            return Some(first);
+            return Frame::New(first);
         }
-        // Nothing yet and never again are the same answer here: either way
-        // the field keeps what it has.
-        self.frames.as_ref()?.try_recv().ok()
+        let Some(frames) = self.frames.as_ref() else {
+            return Frame::Ended;
+        };
+        let mut newest = None;
+        loop {
+            match frames.try_recv() {
+                Ok(frame) => newest = Some(frame),
+                Err(TryRecvError::Empty) => {
+                    return newest.map_or(Frame::Same, Frame::New);
+                }
+                // The reader is gone. Anything it had already handed over is
+                // still the newest thing there is, so it is delivered first
+                // and the end is reported on the next call.
+                Err(TryRecvError::Disconnected) => {
+                    return newest.map_or(Frame::Ended, Frame::New);
+                }
+            }
+        }
     }
 }
 
@@ -159,6 +193,50 @@ impl Drop for Camera {
     }
 }
 
+/// The size ffmpeg will really deliver for `input`, read out of the same
+/// negotiation the capture will do rather than assumed from the request.
+///
+/// `-video_size` is advisory. libavdevice's v4l2 demuxer calls `VIDIOC_S_FMT`,
+/// and when the driver answers with a different size it takes that size and
+/// logs the substitution at info level — which `-loglevel error` hides. Only a
+/// rejected *pixel format* is an error. So a camera that cannot do the mode it
+/// was asked for produces frames of some other size down a pipe that carries
+/// no framing, and reading them at the requested size shears every frame with
+/// nothing anywhere able to notice. Asking ffprobe costs one short-lived
+/// process at startup and removes that failure entirely.
+fn granted(input: &[String]) -> Result<(u32, u32), String> {
+    let mut argv: Vec<String> = ["-v", "error", "-select_streams", "v:0"]
+        .map(String::from)
+        .to_vec();
+    argv.extend_from_slice(input);
+    argv.extend(["-show_entries", "stream=width,height", "-of", "csv=s=x:p=0"].map(String::from));
+    let what = format!("ffprobe {}", input.join(" "));
+
+    let probe = Command::new("ffprobe")
+        .args(&argv)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("{what}: cannot run ffprobe: {e}"))?;
+    if !probe.status.success() {
+        return Err(format!(
+            "{what}: {}; ffprobe's own error is above",
+            probe.status
+        ));
+    }
+    let out = String::from_utf8_lossy(&probe.stdout);
+    let bad = || format!("{what}: cannot read a size out of {out:?}");
+    let (width, height) = out.trim().split_once('x').ok_or_else(bad)?;
+    let size = (
+        width.parse().map_err(|_| bad())?,
+        height.parse().map_err(|_| bad())?,
+    );
+    if size.0 == 0 || size.1 == 0 {
+        return Err(bad());
+    }
+    Ok(size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,30 +254,12 @@ mod tests {
         assert!(argv.windows(2).any(|w| w == ["-f", "v4l2"]));
         assert!(argv.windows(2).any(|w| w == ["-i", "/dev/video0"]));
         assert!(argv.windows(2).any(|w| w == ["-video_size", "1280x720"]));
-        // After -i it would be the output's option and the camera would stay
-        // in its default mode.
+        // After -i it would be the output's option, which scales the frames
+        // instead of asking the driver for the mode.
         assert!(at(&argv, "-video_size") < at(&argv, "-i"));
         // A scaler here would throw away the sensor's shape, which is the one
         // thing the zoom-to-fill needs to know.
         assert!(!argv.iter().any(|a| a == "-vf"), "{argv:?}");
-    }
-
-    /// `false` when there is no ffmpeg to test with. `shell.nix` has one, so
-    /// this only fires outside the pinned shell — printed to stderr, since
-    /// libtest eats a passing test's output and a skip nobody sees is a
-    /// silent pass.
-    fn have_ffmpeg() -> bool {
-        let ok = Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
-        if !ok {
-            use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "SKIPPED: no ffmpeg on PATH");
-        }
-        ok
     }
 
     /// One of ffmpeg's own generators, which is a capture device in every
@@ -210,14 +270,23 @@ mod tests {
     }
 
     #[test]
-    fn a_camera_delivers_whole_frames_of_the_size_it_was_opened_at() {
-        if !have_ffmpeg() {
-            return;
-        }
+    fn the_size_comes_from_the_stream_and_not_from_the_request() {
+        // The failure this guards is a request the driver does not grant, so
+        // the test is a source whose real size is nothing like the one named
+        // in the arguments — and it is the real one that must come back.
+        let camera = Camera::open(&generator("color=c=red:s=97x53:r=30")).unwrap();
+        assert_eq!(camera.size(), (97, 53));
+    }
+
+    #[test]
+    fn a_camera_delivers_whole_frames_of_the_size_it_negotiated() {
         let size = (64, 48);
         // Red, so a channel swap between ffmpeg and here cannot pass.
-        let mut camera = Camera::open(&generator("color=c=red:s=64x48:r=30"), size).unwrap();
-        let frame = camera.frame().expect("open waits for the first frame");
+        let mut camera = Camera::open(&generator("color=c=red:s=64x48:r=30")).unwrap();
+        assert_eq!(camera.size(), size);
+        let Frame::New(frame) = camera.frame() else {
+            panic!("open waits for the first frame")
+        };
         assert_eq!(frame.len(), frame_bytes(size));
         assert!(
             frame
@@ -229,15 +298,12 @@ mod tests {
 
     #[test]
     fn a_camera_that_will_not_open_says_so_at_once() {
-        if !have_ffmpeg() {
-            return;
-        }
-        // Half the contract is the "at once": ffmpeg cannot open this and
-        // exits, which closes the channel, so the wait ends there instead of
-        // running out the ten-second timeout.
+        // Half the contract is the "at once": ffprobe cannot open this and
+        // exits, so the wait ends there instead of running out the ten-second
+        // first-frame timeout.
         let began = std::time::Instant::now();
         let input = ["-f", "v4l2", "-i", "/dev/definitely-not-a-camera"].map(String::from);
-        let Err(why) = Camera::open(&input, (64, 48)) else {
+        let Err(why) = Camera::open(&input) else {
             panic!("a device that is not there opened")
         };
         assert!(why.contains("definitely-not-a-camera"), "{why}");
@@ -250,19 +316,38 @@ mod tests {
 
     #[test]
     fn a_camera_keeps_producing_frames_after_the_first() {
-        if !have_ffmpeg() {
-            return;
-        }
-        let size = (64, 48);
-        let mut camera = Camera::open(&generator("testsrc2=size=64x48:rate=30"), size).unwrap();
+        let mut camera = Camera::open(&generator("testsrc2=size=64x48:rate=30")).unwrap();
         let mut seen = 0;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while seen < 3 && std::time::Instant::now() < deadline {
-            if let Some(frame) = camera.frame() {
-                assert_eq!(frame.len(), frame_bytes(size));
-                seen += 1;
+            match camera.frame() {
+                Frame::New(frame) => {
+                    assert_eq!(frame.len(), frame_bytes(camera.size()));
+                    seen += 1;
+                }
+                Frame::Same => {}
+                Frame::Ended => panic!("the camera ended after {seen} frames"),
             }
         }
         assert_eq!(seen, 3, "the pipe stopped after the first frame");
+    }
+
+    #[test]
+    fn a_camera_that_ends_says_so_rather_than_going_quiet() {
+        // Two frames and stop, which is what an unplugged webcam looks like
+        // from this side. The end has to be reportable: a `Same` forever
+        // leaves the field painting one frozen frame across the whole screen,
+        // which looks like a working installation.
+        // A source with a duration: ffmpeg reaches the end of it and exits,
+        // which is what the reader thread sees when a webcam is unplugged.
+        let mut camera = Camera::open(&generator("color=c=blue:s=32x32:r=30:d=0.2")).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match camera.frame() {
+                Frame::Ended => break,
+                _ if std::time::Instant::now() > deadline => panic!("never reported the end"),
+                _ => {}
+            }
+        }
     }
 }
