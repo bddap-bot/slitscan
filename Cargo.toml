@@ -1,0 +1,18 @@
+[package]
+name = "slitscan"
+version = "0.1.0"
+edition = "2021"
+description = "A slit-scan camera field: one line of live camera per displayed frame, the rest persists"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+pollster = "1.0"
+wgpu = "30.0"
+winit = "0.30"
+
+[dev-dependencies]
+# Only the evidence strip the GPU test writes; nothing shipped decodes an image.
+png = "0.17"

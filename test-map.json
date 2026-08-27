@@ -1,0 +1,34 @@
+{
+  "about": "Touched-path → test-suite map (bothouse#236), read by `botq test-map`. The acceptance gate derives a landed change's touched paths from its own diff and requires the commands mapped here green. First matching rule wins: specific rules above broad ones. `tests: []` means CONSCIOUSLY untested and must carry its why. An unmapped path fails the resolver loud. Commands run from the repo root; lint completeness with `botq test-map --check`.",
+  "rules": [
+    {
+      "paths": ["test-map.json"],
+      "tests": ["botq test-map --check"],
+      "why": "editing the map re-lints its own completeness over every tracked file"
+    },
+    {
+      "paths": ["**/*.md", ".gitignore", "LICENSE-*"],
+      "tests": [],
+      "why": "prose and licenses — nothing executes them"
+    },
+    {
+      "paths": ["run.sh"],
+      "tests": ["nix-shell --run 'shellcheck run.sh'"],
+      "why": "the launcher is three lines of shell and nothing else runs it; shellcheck is the only check there is short of a television"
+    },
+    {
+      "paths": ["shell.nix"],
+      "tests": ["nix-instantiate --parse shell.nix", "nix-shell --run 'cargo build --tests'"],
+      "why": "the pinned dev environment: parsing catches a syntax error, and a build inside it catches a package the toolchain or the wgpu/winit runtime actually needed"
+    },
+    {
+      "paths": ["**/*.rs", "**/*.wgsl", "Cargo.toml", "Cargo.lock"],
+      "tests": [
+        "nix-shell --run 'cargo fmt --check'",
+        "nix-shell --run 'cargo clippy --all-targets -- --deny warnings'",
+        "nix-shell --run 'cargo test'"
+      ],
+      "why": "one crate, one suite. The WGSL rides the same rule because nothing parses it until a pipeline is built, which only the GPU tests in tests/ do — a shader typo is a runtime error, so `cargo build` alone would pass it"
+    }
+  ]
+}
