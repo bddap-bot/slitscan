@@ -3,9 +3,9 @@
 # reading the webcam. Arguments are passed through, so `run.sh --sweep
 # top-to-bottom` flips the line without a rebuild.
 #
-# Through nix-shell rather than the binary directly: wgpu and winit dlopen the
-# Vulkan loader and the windowing libraries at run time, and the shell is what
-# puts them on the library path.
+# Nothing here evaluates nix or cargo: build.sh already wrote what they had to
+# say into target/launch.env, and a launch that had to ask again is twelve
+# seconds of dark screen after the shortcut is clicked (bddap-bot/slitscan#4).
 #
 # `until` is the supervisor, and it is what makes the piece's own error
 # handling worth anything: slitscan stops on a dead camera or a lost surface
@@ -16,6 +16,12 @@
 # on the terminal each time.
 set -euo pipefail
 cd "$(dirname "$0")"
-until nix-shell --run "cargo run --release -- ${*@Q}"; do
+if [ ! -x target/release/slitscan ] || [ ! -f target/launch.env ]; then
+    echo "run.sh: not built — run ./build.sh first" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+. target/launch.env
+until target/release/slitscan "$@"; do
     sleep 5
 done

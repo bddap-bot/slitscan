@@ -26,18 +26,32 @@ use crate::frame_bytes;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ffmpeg's input arguments for a webcam on `device`, asking for its `size`
-/// mode.
+/// mode as MJPEG at sixty frames a second.
+///
+/// The pixel format is named rather than left open because leaving it open is
+/// how the piece ended up at 640x480: libavdevice walks its conversion table
+/// and keeps the first entry the driver accepts *at whatever size the driver
+/// then substitutes*, and a USB 2.0 webcam has the isochronous bandwidth for a
+/// raw mode only at the smallest sizes — so the walk lands on YUYV and 1920
+/// becomes 640. A substituted size is not an error to libavdevice; a rejected
+/// pixel format is. Naming MJPEG turns a camera that cannot do the mode into a
+/// failure at startup rather than a quiet shrink. Sixty is the display's own
+/// rate: one fresh frame per written column, which is the piece's premise.
 ///
 /// Every piece is written here rather than taken from the command line: the
 /// device name lands as the argument of `-i`, which ffmpeg reads positionally,
 /// so nothing a `--device` value can say becomes a flag.
 pub fn v4l2(device: &str, size: (u32, u32)) -> Vec<String> {
-    // Before -i, so it is the *input's* option: after it, ffmpeg reads it as
-    // the output's, which scales rather than negotiates.
+    // Before -i, so these are the *input's* options: after it, ffmpeg reads
+    // them as the output's, which scales rather than negotiates.
     let (width, height) = size;
     [
         "-f",
         "v4l2",
+        "-input_format",
+        "mjpeg",
+        "-framerate",
+        "60",
         "-video_size",
         &format!("{width}x{height}"),
         "-i",
@@ -287,9 +301,14 @@ mod tests {
         assert!(argv.windows(2).any(|w| w == ["-f", "v4l2"]));
         assert!(argv.windows(2).any(|w| w == ["-i", "/dev/video0"]));
         assert!(argv.windows(2).any(|w| w == ["-video_size", "1280x720"]));
-        // After -i it would be the output's option, which scales the frames
-        // instead of asking the driver for the mode.
+        assert!(argv.windows(2).any(|w| w == ["-input_format", "mjpeg"]));
+        assert!(argv.windows(2).any(|w| w == ["-framerate", "60"]));
+        // After -i these would be the output's options: -video_size scales the
+        // frames instead of asking the driver for the mode, and -input_format
+        // is not an output option at all.
         assert!(at(&argv, "-video_size") < at(&argv, "-i"));
+        assert!(at(&argv, "-input_format") < at(&argv, "-i"));
+        assert!(at(&argv, "-framerate") < at(&argv, "-i"));
         // A scaler here would throw away the sensor's shape, which is the one
         // thing the zoom-to-fill needs to know.
         assert!(!argv.iter().any(|a| a == "-vf"), "{argv:?}");

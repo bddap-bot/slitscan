@@ -9,6 +9,7 @@ screen as its film. At 3840 columns and 60 Hz a pass takes sixty-four seconds,
 and that slowness is the piece.
 
 ```
+./build.sh                           # once, after a checkout or a pull
 ./run.sh                             # the webcam, fullscreen, left to right
 ./run.sh --sweep top-to-bottom       # a horizontal line, sweeping down
 ./run.sh --device /dev/video2 --capture 1280x720
@@ -61,8 +62,13 @@ would have worked anyway. Quitting on purpose exits zero and ends the loop.
 
 `shell.nix` pins nixpkgs, carries the `ffmpeg` the camera runs, and puts the
 Vulkan loader and the windowing libraries — which wgpu and winit open at run
-time — on `LD_LIBRARY_PATH`. Without Nix: a Rust toolchain recent enough for
-wgpu 30 and winit 0.30, a working Vulkan driver, and ffmpeg on `PATH`.
+time — on `LD_LIBRARY_PATH`. `build.sh` writes those two values into
+`target/launch.env`, which is why `run.sh` evaluates neither nix nor cargo: the
+installation comes up in about a second instead of waiting out a build.
+
+Without Nix: a Rust toolchain recent enough for wgpu 30 and winit 0.30, a
+working Vulkan driver, ffmpeg on `PATH`, and `cargo build --release` plus an
+empty `target/launch.env` in place of `build.sh`.
 
 ## Tests
 
